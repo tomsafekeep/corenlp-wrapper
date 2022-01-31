@@ -1,0 +1,1 @@
+ exec:java -Dexec.mainClass="com.safekeep.nlp.corenlp.DatabaseTextProcessor"  -Dexec.args="src/main/resources/wrapper_config_tokenize.properties"
