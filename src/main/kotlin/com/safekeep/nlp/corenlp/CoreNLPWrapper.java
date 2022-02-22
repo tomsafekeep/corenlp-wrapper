@@ -8,6 +8,7 @@ import edu.stanford.nlp.pipeline.CoreDocument;
 import edu.stanford.nlp.pipeline.RegexNERAnnotator;
 import edu.stanford.nlp.pipeline.StanfordCoreNLP;
 import edu.stanford.nlp.util.CoreMap;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,7 +19,6 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.time.ZoneId;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -29,13 +29,14 @@ public class CoreNLPWrapper {
     private static final char SENTENCE_SEPARATOR = '\n';
     private static final char TOKEN_SEPARATOR = ' ';
     protected static Logger logger = LoggerFactory.getLogger(CoreNLPWrapper.class);
-
     record Segment(SegmentType type, String noteid, float pos, String content, String id){}
+
     record NoteSegment(String noteid, int pos, Segment main, List<Segment> values){}
     record NoteInformation(List<Segment> content, List<NoteSegment> order, Instant note_version){}
 
     private StanfordCoreNLP nlp;
     final boolean useTagger;
+    private static String quotedSchema;
     Properties props = new Properties();
 
     public CoreNLPWrapper(File kvLexicon, Properties extraCoreNLPProperties) {
@@ -133,11 +134,38 @@ public class CoreNLPWrapper {
             "__label__list_header", SegmentType.list_header, "__label__non_informative", SegmentType.non_informative,
             "__label__header", SegmentType.header, "__label__key", SegmentType.key
     );
-    public List<Segment> processTextE2E(String text, String id, JFastText segmentClassifier) {
+
+    /**
+     * Assume: each segment is >=1 sentences, but sentences never span a segment. Therefore:
+     * 1. Split to sentences.
+     * 2. Classify segments.
+     * @param texts
+     * @param id
+     * @param segmentClassifier
+     * @return
+     */
+    public List<Segment> processPreSegmentedText(List<String> texts, String id, JFastText segmentClassifier) {
+        var segments = new ArrayList<Segment>(texts.size());
+        for (var text:texts) {
+            CoreDocument doc = new CoreDocument(text);
+            nlp.annotate(doc);
+            Annotation anns = doc.annotation();
+            var docSegments = organizeDocumentSegments(id, segmentClassifier, doc);
+            for(var segment:docSegments)
+                segments.add(new Segment(segment.type, segment.noteid, segments.size() /*position across all texts */, segment.content, segment.id));
+        }
+        return segments;
+    }
+    public List<Segment> processUnSegmentedText(String text, String id, JFastText segmentClassifier) {
         CoreDocument doc = new CoreDocument(text);
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
 
+        return organizeDocumentSegments(id, segmentClassifier, doc);
+    }
+
+    @NotNull
+    private List<Segment> organizeDocumentSegments(String id, JFastText segmentClassifier, CoreDocument doc) {
         int sentenceNum = 0;
         List<Segment> segments = new ArrayList<>();
         for (var sent: doc.sentences()){
@@ -294,16 +322,15 @@ public class CoreNLPWrapper {
         return new NoteInformation(content, main, noteVersion);
     }
 
-    ZoneId EDT = ZoneId.of("America/New_York");
     public static int persistSegments(List<NoteInformation> toInsert, Connection pgi) {
         var leader_query ="""
-                INSERT INTO notes.note_segment_leaders
+                INSERT INTO note_segment_leaders
                 (note_version, noteid, segment_num, leader_type, "content")
                 VALUES(?, ?, ?, (?)::notes.segment_type, ?)
                 on conflict do nothing
                 """;
         var follower_query = """
-                INSERT INTO notes.note_segment_followers
+                INSERT INTO note_segment_followers
                 (noteid, segment_num, sentence_num, follower_type, "content")
                 VALUES(?, ?, ?, (?)::notes.segment_type, ?)
                 on conflict do nothing
