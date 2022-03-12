@@ -227,8 +227,8 @@ public class DatabaseTextProcessor {
         return inserted;
     }
     public <C, T> void processQuery(String sourceQuery, int nthreads, Function<ResultSet, C> contentExtractor, SubmitFunction<C, T> submitFunction, PersistenceFunction<T> persistenceFunction){
-        int batchSize = 1000;
         int insert_batch_size = 20000;
+        AtomicInteger total_inserted = new AtomicInteger();
         try(
                 Connection readConn = getConnection(host, port, database, username);
         ){
@@ -252,6 +252,7 @@ public class DatabaseTextProcessor {
                         var pgi = pgis.get();
                         logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
                         int inserted = persistenceFunction.apply(batch, pgi);
+                        total_inserted.addAndGet(inserted);
                         total_submitted.addAndGet(batch.size());
                     }
                     if (nthreads>1) {
@@ -271,6 +272,7 @@ public class DatabaseTextProcessor {
                     var pgi = pgis.get();
                     logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
                     int inserted = persistenceFunction.apply(batch, pgi);
+                    total_inserted.addAndGet(inserted);
                     total_submitted.addAndGet(batch.size());
                 }
             };
@@ -295,15 +297,18 @@ public class DatabaseTextProcessor {
                 if (nthreads>1) {
                     persistor.start();
                 }
-                while (rs.next()){
+                while (!rs.isClosed() /* defensive against calls to rs.next() within contentExtractor */
+                        && rs.next()){
                     int ac=1;
                     var id = rs.getString(ac++);
                     var noteVersion = rs.getTimestamp(ac++).toInstant();
                     var content = contentExtractor.apply(rs); //e.g. rs.getString(2);
 
-                    es.submit(()-> {
-                        submitFunction.apply(id, content, noteVersion, persistQueue);
-                    });
+                    if (content!=null) {
+                        es.submit(()-> {
+                            submitFunction.apply(id, content, noteVersion, persistQueue);
+                        });
+                    }
                     processedRows++;
                     if (processedRows%10000==0){
                         logger.info("Processed {} notes", processedRows);
@@ -331,6 +336,10 @@ public class DatabaseTextProcessor {
         } catch (SQLException e) {
             e.printStackTrace();
 			throw new IllegalStateException("SQL error");
+        }
+        if (total_inserted.get()==0){
+            logger.info("0 records inseted. Exit with error");
+            System.exit(1);
         }
     }
 
