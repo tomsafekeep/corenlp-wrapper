@@ -20,6 +20,7 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
+import java.util.function.BinaryOperator;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -338,6 +339,8 @@ public class CoreNLPWrapper {
         int inserted_segments = 0;
         int inserted_order = 0;
         logger.debug("PersistSegments: batch of {}", toInsert.size());
+        if (toInsert.size()==0 || toInsert.stream().mapToInt(note-> note.order.size()).sum()==0)
+            return 1;
         try (
              var mpo = pgi.prepareStatement(leader_query);
              var fpo = pgi.prepareStatement(follower_query)

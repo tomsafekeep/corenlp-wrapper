@@ -227,7 +227,7 @@ public class DatabaseTextProcessor {
         return inserted;
     }
     public <C, T> void processQuery(String sourceQuery, int nthreads, Function<ResultSet, C> contentExtractor, SubmitFunction<C, T> submitFunction, PersistenceFunction<T> persistenceFunction){
-        int insert_batch_size = 20000;
+        int insert_batch_size = 1000;
         AtomicInteger total_inserted = new AtomicInteger();
         try(
                 Connection readConn = getConnection(host, port, database, username);
