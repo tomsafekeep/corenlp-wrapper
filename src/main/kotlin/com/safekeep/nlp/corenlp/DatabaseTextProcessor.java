@@ -229,6 +229,7 @@ public class DatabaseTextProcessor {
     public <C, T> void processQuery(String sourceQuery, int nthreads, Function<ResultSet, C> contentExtractor, SubmitFunction<C, T> submitFunction, PersistenceFunction<T> persistenceFunction){
         int insert_batch_size = 1000;
         AtomicInteger total_inserted = new AtomicInteger();
+        int processedRows = 0;
         try(
                 Connection readConn = getConnection(host, port, database, username);
         ){
@@ -286,7 +287,6 @@ public class DatabaseTextProcessor {
             ){
                 source.setFetchSize(10000);
                 var rs = source.executeQuery();
-                int processedRows = 0;
                 AtomicInteger kvInsertBatch = new AtomicInteger();
                 logger.info("Start executor service with {} threads", threadLimit);
                 ExecutorService es = nthreads > 1 ? new ThreadPoolExecutor(nthreads, threadLimit,
@@ -337,8 +337,8 @@ public class DatabaseTextProcessor {
             e.printStackTrace();
 			throw new IllegalStateException("SQL error");
         }
-        if (total_inserted.get()==0){
-            logger.info("0 records inseted. Exit with error");
+        if (processedRows>0 && total_inserted.get()==0){
+            logger.info("0 records inserted. Exit with error");
             System.exit(1);
         }
     }
@@ -460,8 +460,10 @@ public class DatabaseTextProcessor {
         this.outputSchemaName = outputSchemaName;
         this.nlp = new CoreNLPWrapper(kvLexiconFile, extraCoreNLPProperties);
         if (segmentClassifierFile!=null) {
+            logger.info("Load FastText model from {}", segmentClassifierFile);
             fasttext = new JFastText();
             fasttext.loadModel(segmentClassifierFile.getAbsolutePath());
+            logger.info("Loaded FastText model with {}", String.join(", ", fasttext.getLabels()));
         }else{
             fasttext = null;
         }
@@ -523,7 +525,8 @@ public class DatabaseTextProcessor {
             switch (mode){
                 case RAW_TO_SEGMENTS, CHUNKS_TO_SEGMENTS -> {
                     kvLexiconFile = new File(props.getProperty("kv_lexicon"));
-                    segmentClassifierFile = new File(props.getProperty("segment_classifier"));
+                    String scPath = props.getProperty("segment_classifier");
+                    segmentClassifierFile = scPath.trim().equals("null")?null:new File(scPath);
                 }
                 default ->{}
             }
