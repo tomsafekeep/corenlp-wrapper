@@ -20,7 +20,9 @@ import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
+import java.util.function.BiFunction;
 import java.util.function.BinaryOperator;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -147,28 +149,40 @@ public class CoreNLPWrapper {
      */
     public List<Segment> processPreSegmentedText(List<String> texts, String id, JFastText segmentClassifier) {
         var segments = new ArrayList<Segment>(texts.size());
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier);
         for (var text:texts) {
             CoreDocument doc = new CoreDocument(text);
             nlp.annotate(doc);
             Annotation anns = doc.annotation();
-            var docSegments = organizeDocumentSegments(id, segmentClassifier, doc);
+            var docSegments = organizeDocumentSegments(id, classifier, doc);
             for(var segment:docSegments)
                 segments.add(new Segment(segment.type, segment.noteid, segments.size() /*position across all texts */, segment.content, segment.id));
         }
         return segments;
     }
+
+    @NotNull
+    private BiFunction<String, SegmentType, String> fasttextInstance2ClassifierFunction(JFastText segmentClassifier) {
+        return segmentClassifier != null ?
+                (val, previousLabel) -> segmentClassifier.predict(val) :
+                (val, previousLabel) -> previousLabel==SegmentType.key?
+                        "__label__value":
+                        "__label__narrative";
+    }
+
     public List<Segment> processUnSegmentedText(String text, String id, JFastText segmentClassifier) {
         CoreDocument doc = new CoreDocument(text);
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
-
-        return organizeDocumentSegments(id, segmentClassifier, doc);
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier);
+        return organizeDocumentSegments(id, classifier, doc);
     }
 
     @NotNull
-    private List<Segment> organizeDocumentSegments(String id, JFastText segmentClassifier, CoreDocument doc) {
+    private List<Segment> organizeDocumentSegments(String id, BiFunction<String, SegmentType, String> segmentClassifier, CoreDocument doc) {
         int sentenceNum = 0;
         List<Segment> segments = new ArrayList<>();
+        SegmentType previousSpanLabel = null;
         for (var sent: doc.sentences()){
             boolean insideMention = false;
             List<String> spanTokens = new ArrayList<>();
@@ -186,6 +200,7 @@ public class CoreNLPWrapper {
                             var segment = new Segment(SegmentType.key, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                             segments.add(segment);
                             spanTokens.clear();
+                            previousSpanLabel = SegmentType.key;
                         }
                         insideMention=false;
                         spanTokens.add(word);
@@ -197,9 +212,11 @@ public class CoreNLPWrapper {
                     if (isMention){
                         if (spanTokens.size()>0){
                             String span = String.join(" ", spanTokens);
-                            var label = segmentClassifier.predict(span);
+                            var label = segmentClassifier.apply(span, previousSpanLabel);
+                            var stype = ftLabel2SegmentType.get(label);
                             var segment = new Segment(ftLabel2SegmentType.get(label), id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                             segments.add(segment);
+                            previousSpanLabel= stype;
                             spanTokens.clear();
                         }
                         //Begin key
@@ -214,8 +231,10 @@ public class CoreNLPWrapper {
             }
             if (spanTokens.size()>0){
                 String span = String.join(" ", spanTokens);
-                var segment = new Segment(insideMention?SegmentType.key:ftLabel2SegmentType.get(segmentClassifier.predict(span)), id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                SegmentType segmentType = ftLabel2SegmentType.get(segmentClassifier.apply(span, previousSpanLabel));
+                var segment = new Segment(insideMention?SegmentType.key: segmentType, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                 segments.add(segment);
+                previousSpanLabel = segmentType;
                 spanTokens.clear();
             }
             sentenceNum++;
@@ -327,13 +346,13 @@ public class CoreNLPWrapper {
         var leader_query ="""
                 INSERT INTO note_segment_leaders
                 (note_version, noteid, segment_num, leader_type, "content")
-                VALUES(?, ?, ?, (?)::notes.segment_type, ?)
+                VALUES(?, ?, ?, (?)::segment_type, ?)
                 on conflict do nothing
                 """;
         var follower_query = """
                 INSERT INTO note_segment_followers
                 (noteid, segment_num, sentence_num, follower_type, "content")
-                VALUES(?, ?, ?, (?)::notes.segment_type, ?)
+                VALUES(?, ?, ?, (?)::segment_type, ?)
                 on conflict do nothing
                 """;
         int inserted_segments = 0;
