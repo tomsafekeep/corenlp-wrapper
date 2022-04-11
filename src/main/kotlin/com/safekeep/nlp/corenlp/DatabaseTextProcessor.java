@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 public class DatabaseTextProcessor {
     static Logger logger = LoggerFactory.getLogger(DatabaseTextProcessor.class);
@@ -75,6 +76,7 @@ public class DatabaseTextProcessor {
     final ThreadLocal<Connection> pgis = ThreadLocal.withInitial(this::createInsertConnection);
     final Set<Connection> toClose = new HashSet<>();
     final CoreNLPWrapper nlp;
+    final boolean prefixWithIsPreviousKey;
     final Mode mode;
     public void processQueryFile(String query, String kvInsertQuery, File outputPath){
         try(
@@ -170,7 +172,7 @@ public class DatabaseTextProcessor {
     public record TokenizedNote(String id, Instant noteVersion, List<String> tokens){};
 
     private void submitForSegmentation(String id, String content, Instant noteVersion, BlockingQueue<CoreNLPWrapper.NoteInformation> persistQueue){
-        var segments = nlp.processUnSegmentedText(content, id, fasttext);
+        var segments = nlp.processUnSegmentedText(content, id, fasttext, prefixWithIsPreviousKey);
         var organized = nlp.organizeSegments(segments, noteVersion);
         try {
             persistQueue.put(organized);
@@ -180,7 +182,7 @@ public class DatabaseTextProcessor {
         }
     }
     private void submitForOrganization(String id, String[] content, Instant noteVersion, BlockingQueue<CoreNLPWrapper.NoteInformation> persistQueue){
-        var segments = nlp.processPreSegmentedText(List.of(content), id, fasttext);
+        var segments = nlp.processPreSegmentedText(List.of(content), id, fasttext, prefixWithIsPreviousKey);
         var organized = nlp.organizeSegments(segments, noteVersion);
         try {
             persistQueue.put(organized);
@@ -241,13 +243,39 @@ public class DatabaseTextProcessor {
             BlockingQueue<T> persistQueue = new ArrayBlockingQueue<>(insert_batch_size*5);
             AtomicBoolean resultSetExhausted = new AtomicBoolean(false);
             AtomicInteger total_submitted = new AtomicInteger();
-            Runnable persistorFunc = ()->{
-                Object obj = new Object();
-                while (!resultSetExhausted.get()) {
-                    if (persistQueue.size() >= insert_batch_size) {
+            Runnable persistorFunc;
+
+            var persistors = new ArrayList<Thread>();
+            for (int i=0; i<Math.max(nthreads/10, 2); i++) {
+                Runnable runnable = new Runnable() {
+                    @Override
+                    public void run() {
+                    logger.info("Started thread {}", Thread.currentThread().getName());
+                    while (!resultSetExhausted.get()) {
+                        if (persistQueue.size() >= insert_batch_size) {
+                            var batch = new ArrayList<T>(persistQueue.size());
+                            synchronized (persistQueue) {
+                                logger.info("Persist {} notes", persistQueue.size());
+                                persistQueue.drainTo(batch);
+                            }
+                            var pgi = pgis.get();
+                            logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
+                            int inserted = persistenceFunction.apply(batch, pgi);
+                            total_inserted.addAndGet(inserted);
+                            total_submitted.addAndGet(batch.size());
+                        }
+                        if (nthreads > 1) {
+                            try {
+                                Thread.sleep(1000);
+                            } catch (InterruptedException e) {
+                                e.printStackTrace();
+                            }
+                        }
+                    }
+                    if (persistQueue.size() > 0) {
                         var batch = new ArrayList<T>(persistQueue.size());
                         synchronized (persistQueue) {
-                            logger.info("Persist {} notes", persistQueue.size());
+                            logger.info("Persist last batch with {} notes", persistQueue.size());
                             persistQueue.drainTo(batch);
                         }
                         var pgi = pgis.get();
@@ -256,28 +284,12 @@ public class DatabaseTextProcessor {
                         total_inserted.addAndGet(inserted);
                         total_submitted.addAndGet(batch.size());
                     }
-                    if (nthreads>1) {
-                        try {
-                            Thread.sleep(1000);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                        }
-                    }
-                }
-                if (persistQueue.size() > 0) {
-                    var batch = new ArrayList<T>(persistQueue.size());
-                    synchronized (persistQueue) {
-                        logger.info("Persist last batch with {} notes", persistQueue.size());
-                        persistQueue.drainTo(batch);
-                    }
-                    var pgi = pgis.get();
-                    logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
-                    int inserted = persistenceFunction.apply(batch, pgi);
-                    total_inserted.addAndGet(inserted);
-                    total_submitted.addAndGet(batch.size());
-                }
-            };
-            Thread persistor = new Thread(persistorFunc);
+                    logger.info("Close thread {}", Thread.currentThread().getName());
+                }};
+                    Thread thread = new Thread(runnable, "persistor_" + String.format("%02d", i));
+                    persistors.add(thread);
+            }
+            //IntStream.range(0, Math.max(nthreads/10, 2)).mapToObj(i-> new Thread(persistorFunc, "persistor_"+String.format("%02d", i))).collect(Collectors.toList()); //new Thread(persistorFunc);
             logger.info("Start persistor thread");
 
             int threadLimit = nthreads;
@@ -295,7 +307,8 @@ public class DatabaseTextProcessor {
                         : Executors.newSingleThreadExecutor();
                 logger.info("Start persistor thread");
                 if (nthreads>1) {
-                    persistor.start();
+                    for (var persistor: persistors)
+                        persistor.start();
                 }
                 while (!rs.isClosed() /* defensive against calls to rs.next() within contentExtractor */
                         && rs.next()){
@@ -320,9 +333,10 @@ public class DatabaseTextProcessor {
                 try {
                     es.awaitTermination(300, TimeUnit.SECONDS);
                     if (nthreads>1) {
-                        persistor.join(300000);
+                        for (var persistor:persistors)
+                            persistor.join(300000);
                     }else{
-                        persistorFunc.run();
+                        //persistorFunc*.run();
                     }
                 } catch (InterruptedException e) {
                     logger.warn("Executor service timed-out");
@@ -343,116 +357,7 @@ public class DatabaseTextProcessor {
         }
     }
 
-    @Deprecated
-    public void processQueryE2E(String query, int nthreads){
-        int batchSize = 1000;
-        int insert_batch_size = 1000;
-        try(
-            Connection readConn = getConnection(host, port, database, username);
-        ){
-            readConn.setAutoCommit(false);
-            BlockingQueue<Runnable> rawQueue = new ArrayBlockingQueue<>(1000);
-            BlockingQueue<CoreNLPWrapper.NoteInformation> persistQueue = new ArrayBlockingQueue<>(1000);
-            AtomicBoolean resultSetExhausted = new AtomicBoolean(false);
-            AtomicInteger total_submitted = new AtomicInteger();
-            Runnable persistorFunc = ()->{
-                Object obj = new Object();
-                while (!resultSetExhausted.get()) {
-                    if (persistQueue.size() >= insert_batch_size) {
-                        var batch = new ArrayList<CoreNLPWrapper.NoteInformation>(persistQueue.size());
-                        synchronized (persistQueue) {
-                            logger.info("Persist {} notes", persistQueue.size());
-                            persistQueue.drainTo(batch);
-                        }
-                        var pgi = pgis.get();
-                        logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
-                        int inserted = nlp.persistSegments(batch, pgi);
-                        total_submitted.addAndGet(batch.size());
-                    }
-                    if (nthreads>1) {
-                        try {
-                            Thread.sleep(1000);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                        }
-                    }
-                }
-                if (persistQueue.size() > 0) {
-                    var batch = new ArrayList<CoreNLPWrapper.NoteInformation>(persistQueue.size());
-                    synchronized (persistQueue) {
-                        logger.info("Persist last batch with {} notes", persistQueue.size());
-                        persistQueue.drainTo(batch);
-                    }
-                    var pgi = pgis.get();
-                    logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
-                    int inserted = nlp.persistSegments(batch, pgi);
-                    total_submitted.addAndGet(batch.size());
-                }
-            };
-            Thread persistor = new Thread(persistorFunc);
-            logger.info("Start persistor thread");
-
-            int threadLimit = nthreads;
-            try(
-                var source = readConn.prepareStatement(query);
-            ){
-                source.setFetchSize(10000);
-                var rs = source.executeQuery();
-                int processedRows = 0;
-                AtomicInteger kvInsertBatch = new AtomicInteger();
-                logger.info("Start executor service with {} threads", threadLimit);
-                ExecutorService es = nthreads > 1 ? new ThreadPoolExecutor(nthreads, threadLimit, 10000, TimeUnit.MILLISECONDS, rawQueue,
-                        new ThreadPoolExecutor.CallerRunsPolicy())
-                        : Executors.newSingleThreadExecutor();
-                logger.info("Start persistor thread");
-                if (nthreads>1) {
-                    persistor.start();
-                }
-                while (rs.next()){
-                    var content = rs.getString(2);
-                    var id = rs.getString(1);
-                    var noteVersion = rs.getTimestamp(3).toInstant();
-
-                    es.submit(()-> {
-                        var segments = nlp.processUnSegmentedText(content, id, fasttext);
-                        var organized = nlp.organizeSegments(segments, noteVersion);
-                        try {
-                            persistQueue.put(organized);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                            logger.warn("Inserting to persist queue was interrupted when trying to insert note {}", organized.order().get(0).noteid());
-                        }
-                    });
-                    processedRows++;
-                    if (processedRows%1000==0){
-                        logger.info("Processed {} notes", processedRows);
-                    }
-                }
-                logger.info("Exhausted result set after {} rows. Await finishing {} tasks", processedRows, rawQueue.size());
-                resultSetExhausted.set(true);
-                es.shutdown();
-                try {
-                    es.awaitTermination(300, TimeUnit.SECONDS);
-                    if (nthreads>1) {
-                        persistor.join(300000);
-                    }else{
-                        persistorFunc.run();
-                    }
-                } catch (InterruptedException e) {
-                    logger.warn("Executor service timed-out");
-                }finally{
-                    logger.info("Close {} thread-specific connections", toClose.size());
-                    for (var pgi:toClose){
-                        pgi.close();
-                    }
-                }
-            }
-        } catch (SQLException e) {
-            e.printStackTrace();
-        }
-    }
-
-    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, String outputSchemaName, File kvLexiconFile, File segmentClassifierFile, Properties extraCoreNLPProperties) {
+    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, String outputSchemaName, File kvLexiconFile, File segmentClassifierFile, boolean prefixWithIsPreviousKey, Properties extraCoreNLPProperties) {
         this.host = host;
         this.port = port;
         this.database = database;
@@ -463,11 +368,12 @@ public class DatabaseTextProcessor {
             logger.info("Load FastText model from {}", segmentClassifierFile);
             fasttext = new JFastText();
             fasttext.loadModel(segmentClassifierFile.getAbsolutePath());
-            logger.info("Loaded FastText model with {}", String.join(", ", fasttext.getLabels()));
+            logger.info("Loaded FastText model with {}", String.join(", ", fasttext.getModelName()));
         }else{
             fasttext = null;
         }
         this.mode = mode;
+        this.prefixWithIsPreviousKey = prefixWithIsPreviousKey;
     }
 
     public static String getContent(ResultSet rs){
@@ -491,6 +397,7 @@ public class DatabaseTextProcessor {
                 """;
         File kvLexiconFile = new File("");//lexicon file
         File segmentClassifierFile = new File("");//segment classifier
+        boolean prefixWithIsPreviousKey = false;
 
         Properties props = new Properties();
         File propsFile = new File(args[0]);
@@ -527,6 +434,7 @@ public class DatabaseTextProcessor {
                     kvLexiconFile = new File(props.getProperty("kv_lexicon"));
                     String scPath = props.getProperty("segment_classifier");
                     segmentClassifierFile = scPath.trim().equals("null")?null:new File(scPath);
+                    prefixWithIsPreviousKey = Boolean.parseBoolean(props.getProperty("prefix_with_is_previous_a_key", "false"));
                 }
                 default ->{}
             }
@@ -536,11 +444,11 @@ public class DatabaseTextProcessor {
         DatabaseTextProcessor processor;
         switch (mode){
             case RAW_TO_SEGMENTS -> {
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, null);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
                 processor.processQuery(notesQuery, nthreads, DatabaseTextProcessor::getContent, processor::submitForSegmentation, CoreNLPWrapper::persistSegments);
             }
             case CHUNKS_TO_SEGMENTS -> {
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, null);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
                 AtomicReference<String> previousNoteid = new AtomicReference<>();
                 processor.processQuery(notesQuery, nthreads, (ResultSet rs)->{
                     try {
@@ -567,7 +475,7 @@ public class DatabaseTextProcessor {
             case RAW_TO_TOKENS -> {
                 Properties extraCoreNLPProperties = new Properties();
                 extraCoreNLPProperties.put("ssplit.isOneSentence", Boolean.toString(true));
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, null, null, extraCoreNLPProperties);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, null, null, prefixWithIsPreviousKey, extraCoreNLPProperties);
                 processor.processQuery(notesQuery, nthreads,DatabaseTextProcessor::getContent,  processor::submitForSingleSentenceTokenization, DatabaseTextProcessor::persistTokens);
             }
             default -> throw new IllegalStateException("Unexpected value: " + mode);
