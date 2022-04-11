@@ -21,8 +21,6 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.*;
 import java.util.function.BiFunction;
-import java.util.function.BinaryOperator;
-import java.util.function.Function;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -147,9 +145,9 @@ public class CoreNLPWrapper {
      * @param segmentClassifier
      * @return
      */
-    public List<Segment> processPreSegmentedText(List<String> texts, String id, JFastText segmentClassifier) {
+    public List<Segment> processPreSegmentedText(List<String> texts, String id, JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
         var segments = new ArrayList<Segment>(texts.size());
-        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier);
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier, prefixWithIsPreviousKey);
         for (var text:texts) {
             CoreDocument doc = new CoreDocument(text);
             nlp.annotate(doc);
@@ -162,19 +160,23 @@ public class CoreNLPWrapper {
     }
 
     @NotNull
-    private BiFunction<String, SegmentType, String> fasttextInstance2ClassifierFunction(JFastText segmentClassifier) {
+    private BiFunction<String, SegmentType, String> fasttextInstance2ClassifierFunction(JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
         return segmentClassifier != null ?
-                (val, previousLabel) -> segmentClassifier.predict(val) :
+                (val, previousLabel) -> segmentClassifier.predict(
+                        prefixWithIsPreviousKey && previousLabel!=null?
+                            String.join(" ", previousLabel.name(), val)
+                            :val)
+                :
                 (val, previousLabel) -> previousLabel==SegmentType.key?
                         "__label__value":
                         "__label__narrative";
     }
 
-    public List<Segment> processUnSegmentedText(String text, String id, JFastText segmentClassifier) {
+    public List<Segment> processUnSegmentedText(String text, String id, JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
         CoreDocument doc = new CoreDocument(text);
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
-        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier);
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier, prefixWithIsPreviousKey);
         return organizeDocumentSegments(id, classifier, doc);
     }
 
@@ -214,7 +216,9 @@ public class CoreNLPWrapper {
                             String span = String.join(" ", spanTokens);
                             var label = segmentClassifier.apply(span, previousSpanLabel);
                             var stype = ftLabel2SegmentType.get(label);
-                            var segment = new Segment(ftLabel2SegmentType.get(label), id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                            if (previousSpanLabel==SegmentType.key && stype==SegmentType.narrative)
+                                stype = SegmentType.value; //narrative and values are similar - prioritize value.
+                            var segment = new Segment(stype, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                             segments.add(segment);
                             previousSpanLabel= stype;
                             spanTokens.clear();
@@ -232,6 +236,9 @@ public class CoreNLPWrapper {
             if (spanTokens.size()>0){
                 String span = String.join(" ", spanTokens);
                 SegmentType segmentType = ftLabel2SegmentType.get(segmentClassifier.apply(span, previousSpanLabel));
+                if (previousSpanLabel==SegmentType.key && segmentType==SegmentType.narrative) {
+                    segmentType = SegmentType.value; //narrative and values are similar - prioritize value.
+                }
                 var segment = new Segment(insideMention?SegmentType.key: segmentType, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                 segments.add(segment);
                 previousSpanLabel = segmentType;
