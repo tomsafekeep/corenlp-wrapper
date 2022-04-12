@@ -243,54 +243,6 @@ public class DatabaseTextProcessor {
             BlockingQueue<T> persistQueue = new ArrayBlockingQueue<>(insert_batch_size*5);
             AtomicBoolean resultSetExhausted = new AtomicBoolean(false);
             AtomicInteger total_submitted = new AtomicInteger();
-            Runnable persistorFunc;
-
-            var persistors = new ArrayList<Thread>();
-            for (int i=0; i<Math.max(nthreads/10, 2); i++) {
-                Runnable runnable = new Runnable() {
-                    @Override
-                    public void run() {
-                    logger.info("Started thread {}", Thread.currentThread().getName());
-                    while (!resultSetExhausted.get()) {
-                        if (persistQueue.size() >= insert_batch_size) {
-                            var batch = new ArrayList<T>(persistQueue.size());
-                            synchronized (persistQueue) {
-                                logger.info("Persist {} notes", persistQueue.size());
-                                persistQueue.drainTo(batch);
-                            }
-                            var pgi = pgis.get();
-                            logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
-                            int inserted = persistenceFunction.apply(batch, pgi);
-                            total_inserted.addAndGet(inserted);
-                            total_submitted.addAndGet(batch.size());
-                        }
-                        if (nthreads > 1) {
-                            try {
-                                Thread.sleep(1000);
-                            } catch (InterruptedException e) {
-                                e.printStackTrace();
-                            }
-                        }
-                    }
-                    if (persistQueue.size() > 0) {
-                        var batch = new ArrayList<T>(persistQueue.size());
-                        synchronized (persistQueue) {
-                            logger.info("Persist last batch with {} notes", persistQueue.size());
-                            persistQueue.drainTo(batch);
-                        }
-                        var pgi = pgis.get();
-                        logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
-                        int inserted = persistenceFunction.apply(batch, pgi);
-                        total_inserted.addAndGet(inserted);
-                        total_submitted.addAndGet(batch.size());
-                    }
-                    logger.info("Close thread {}", Thread.currentThread().getName());
-                }};
-                    Thread thread = new Thread(runnable, "persistor_" + String.format("%02d", i));
-                    persistors.add(thread);
-            }
-            //IntStream.range(0, Math.max(nthreads/10, 2)).mapToObj(i-> new Thread(persistorFunc, "persistor_"+String.format("%02d", i))).collect(Collectors.toList()); //new Thread(persistorFunc);
-            logger.info("Start persistor thread");
 
             int threadLimit = nthreads;
             logger.info("Execute source query:\n{}", sourceQuery);
@@ -302,14 +254,9 @@ public class DatabaseTextProcessor {
                 AtomicInteger kvInsertBatch = new AtomicInteger();
                 logger.info("Start executor service with {} threads", threadLimit);
                 ExecutorService es = nthreads > 1 ? new ThreadPoolExecutor(nthreads, threadLimit,
-            10000, TimeUnit.MILLISECONDS, rawQueue,
-                        new ThreadPoolExecutor.CallerRunsPolicy())
+                10000, TimeUnit.MILLISECONDS, rawQueue,
+                            new ThreadPoolExecutor.CallerRunsPolicy())
                         : Executors.newSingleThreadExecutor();
-                logger.info("Start persistor thread");
-                if (nthreads>1) {
-                    for (var persistor: persistors)
-                        persistor.start();
-                }
                 while (!rs.isClosed() /* defensive against calls to rs.next() within contentExtractor */
                         && rs.next()){
                     int ac=1;
@@ -320,6 +267,23 @@ public class DatabaseTextProcessor {
                     if (content!=null) {
                         es.submit(()-> {
                             submitFunction.apply(id, content, noteVersion, persistQueue);
+                            if (persistQueue.size() >= insert_batch_size) {
+                                var batch = new ArrayList<T>(persistQueue.size());
+                                synchronized (persistQueue) {
+                                    // race condition - the queue might be drained between the check and the synchronized block
+                                    if (persistQueue.size() >= insert_batch_size) {
+                                        logger.info("Persist {} notes", persistQueue.size());
+                                        persistQueue.drainTo(batch);
+                                    }
+                                }
+                                if (batch.size()>0){
+                                    var pgi = pgis.get();
+                                    logger.info("Submit batch with {} notes ({} so far)", batch.size(), total_submitted.get());
+                                    int inserted = persistenceFunction.apply(batch, pgi);
+                                    total_inserted.addAndGet(inserted);
+                                    total_submitted.addAndGet(batch.size());
+                                }
+                            }
                         });
                     }
                     processedRows++;
@@ -332,9 +296,19 @@ public class DatabaseTextProcessor {
                 es.shutdown();
                 try {
                     es.awaitTermination(300, TimeUnit.SECONDS);
+                    if (persistQueue.size() > 0) {
+                        var batch = new ArrayList<T>(persistQueue.size());
+                        synchronized (persistQueue) {
+                            logger.info("Persist {} notes", persistQueue.size());
+                            persistQueue.drainTo(batch);
+                        }
+                        var pgi = pgis.get();
+                        logger.info("Submit LAST batch with {} notes ({} so far)", batch.size(), total_submitted.get());
+                        int inserted = persistenceFunction.apply(batch, pgi);
+                        total_inserted.addAndGet(inserted);
+                        total_submitted.addAndGet(batch.size());
+                    }
                     if (nthreads>1) {
-                        for (var persistor:persistors)
-                            persistor.join(300000);
                     }else{
                         //persistorFunc*.run();
                     }
