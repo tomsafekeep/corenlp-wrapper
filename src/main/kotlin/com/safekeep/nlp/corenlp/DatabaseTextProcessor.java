@@ -308,10 +308,6 @@ public class DatabaseTextProcessor {
                         total_inserted.addAndGet(inserted);
                         total_submitted.addAndGet(batch.size());
                     }
-                    if (nthreads>1) {
-                    }else{
-                        //persistorFunc*.run();
-                    }
                 } catch (InterruptedException e) {
                     logger.warn("Executor service timed-out");
                 }finally{
