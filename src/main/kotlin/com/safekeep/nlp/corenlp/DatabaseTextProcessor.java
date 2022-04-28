@@ -454,6 +454,7 @@ public class DatabaseTextProcessor {
         Mode mode=Mode.RAW_TO_TOKENS;
         int nthreads = Runtime.getRuntime().availableProcessors();
         List<Replacement> replacements = List.of();
+        boolean ignoreCase=false;
         try(BufferedReader br = Files.newBufferedReader(propsFile.toPath())){
             props.load(br);
             host = props.getProperty("host");
@@ -478,6 +479,7 @@ public class DatabaseTextProcessor {
                 .filter(pat -> pat!=null)
                 .collect(Collectors.toList());
             }
+            ignoreCase=Boolean.parseBoolean(props.getProperty("kv_lexicon_ignore_case", Boolean.toString(false)));
         } catch (IOException e) {
             e.printStackTrace();
         }
@@ -486,7 +488,11 @@ public class DatabaseTextProcessor {
             case RAW_TO_SEGMENTS -> {
                 File kvLexiconFile = new File("");//lexicon file
                 File segmentClassifierFile = new File("");//segment classifier
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, kvLexiconFile, segmentClassifierFile, null);
+                Properties extraCoreNLPProperties = new Properties();
+                if (ignoreCase){
+                    extraCoreNLPProperties.put("regexner.ignorecase", Boolean.toString(ignoreCase));
+                }
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, kvLexiconFile, segmentClassifierFile, extraCoreNLPProperties);
                 processor.processQuery(notesQuery, nthreads, processor::submitForSegmentation, CoreNLPWrapper::persistSegments);
             }
             case RAW_TO_TOKENS -> {
