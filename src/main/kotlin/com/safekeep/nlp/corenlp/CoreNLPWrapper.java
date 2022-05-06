@@ -8,6 +8,7 @@ import edu.stanford.nlp.pipeline.CoreDocument;
 import edu.stanford.nlp.pipeline.RegexNERAnnotator;
 import edu.stanford.nlp.pipeline.StanfordCoreNLP;
 import edu.stanford.nlp.util.CoreMap;
+import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,8 +19,8 @@ import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
-import java.time.ZoneId;
 import java.util.*;
+import java.util.function.BiFunction;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -29,13 +30,14 @@ public class CoreNLPWrapper {
     private static final char SENTENCE_SEPARATOR = '\n';
     private static final char TOKEN_SEPARATOR = ' ';
     protected static Logger logger = LoggerFactory.getLogger(CoreNLPWrapper.class);
-
     record Segment(SegmentType type, String noteid, float pos, String content, String id){}
+
     record NoteSegment(String noteid, int pos, Segment main, List<Segment> values){}
     record NoteInformation(List<Segment> content, List<NoteSegment> order, Instant note_version){}
 
     private StanfordCoreNLP nlp;
     final boolean useTagger;
+    private static String quotedSchema;
     Properties props = new Properties();
 
     public CoreNLPWrapper(File kvLexicon, Properties extraCoreNLPProperties) {
@@ -133,13 +135,56 @@ public class CoreNLPWrapper {
             "__label__list_header", SegmentType.list_header, "__label__non_informative", SegmentType.non_informative,
             "__label__header", SegmentType.header, "__label__key", SegmentType.key
     );
-    public List<Segment> processTextE2E(String text, String id, JFastText segmentClassifier) {
+
+    /**
+     * Assume: each segment is >=1 sentences, but sentences never span a segment. Therefore:
+     * 1. Split to sentences.
+     * 2. Classify segments.
+     * @param texts
+     * @param id
+     * @param segmentClassifier
+     * @return
+     */
+    public List<Segment> processPreSegmentedText(List<String> texts, String id, JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
+        var segments = new ArrayList<Segment>(texts.size());
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier, prefixWithIsPreviousKey);
+        for (var text:texts) {
+            CoreDocument doc = new CoreDocument(text);
+            nlp.annotate(doc);
+            Annotation anns = doc.annotation();
+            var docSegments = organizeDocumentSegments(id, classifier, doc);
+            for(var segment:docSegments)
+                segments.add(new Segment(segment.type, segment.noteid, segments.size() /*position across all texts */, segment.content, segment.id));
+        }
+        return segments;
+    }
+
+    @NotNull
+    private BiFunction<String, SegmentType, String> fasttextInstance2ClassifierFunction(JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
+        return segmentClassifier != null ?
+                (val, previousLabel) -> segmentClassifier.predict(
+                        prefixWithIsPreviousKey && previousLabel!=null?
+                            String.join(" ", previousLabel.name(), val)
+                            :val)
+                :
+                (val, previousLabel) -> previousLabel==SegmentType.key?
+                        "__label__value":
+                        "__label__narrative";
+    }
+
+    public List<Segment> processUnSegmentedText(String text, String id, JFastText segmentClassifier, boolean prefixWithIsPreviousKey) {
         CoreDocument doc = new CoreDocument(text);
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
+        var classifier = fasttextInstance2ClassifierFunction(segmentClassifier, prefixWithIsPreviousKey);
+        return organizeDocumentSegments(id, classifier, doc);
+    }
 
+    @NotNull
+    private List<Segment> organizeDocumentSegments(String id, BiFunction<String, SegmentType, String> segmentClassifier, CoreDocument doc) {
         int sentenceNum = 0;
         List<Segment> segments = new ArrayList<>();
+        SegmentType previousSpanLabel = null;
         for (var sent: doc.sentences()){
             boolean insideMention = false;
             List<String> spanTokens = new ArrayList<>();
@@ -157,6 +202,7 @@ public class CoreNLPWrapper {
                             var segment = new Segment(SegmentType.key, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                             segments.add(segment);
                             spanTokens.clear();
+                            previousSpanLabel = SegmentType.key;
                         }
                         insideMention=false;
                         spanTokens.add(word);
@@ -168,9 +214,13 @@ public class CoreNLPWrapper {
                     if (isMention){
                         if (spanTokens.size()>0){
                             String span = String.join(" ", spanTokens);
-                            var label = segmentClassifier.predict(span);
-                            var segment = new Segment(ftLabel2SegmentType.get(label), id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                            var label = segmentClassifier.apply(span, previousSpanLabel);
+                            var stype = ftLabel2SegmentType.get(label);
+                            if (previousSpanLabel==SegmentType.key && stype==SegmentType.narrative)
+                                stype = SegmentType.value; //narrative and values are similar - prioritize value.
+                            var segment = new Segment(stype, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                             segments.add(segment);
+                            previousSpanLabel= stype;
                             spanTokens.clear();
                         }
                         //Begin key
@@ -185,8 +235,13 @@ public class CoreNLPWrapper {
             }
             if (spanTokens.size()>0){
                 String span = String.join(" ", spanTokens);
-                var segment = new Segment(insideMention?SegmentType.key:ftLabel2SegmentType.get(segmentClassifier.predict(span)), id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                SegmentType segmentType = ftLabel2SegmentType.get(segmentClassifier.apply(span, previousSpanLabel));
+                if (previousSpanLabel==SegmentType.key && segmentType==SegmentType.narrative) {
+                    segmentType = SegmentType.value; //narrative and values are similar - prioritize value.
+                }
+                var segment = new Segment(insideMention?SegmentType.key: segmentType, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
                 segments.add(segment);
+                previousSpanLabel = segmentType;
                 spanTokens.clear();
             }
             sentenceNum++;
@@ -294,23 +349,24 @@ public class CoreNLPWrapper {
         return new NoteInformation(content, main, noteVersion);
     }
 
-    ZoneId EDT = ZoneId.of("America/New_York");
     public static int persistSegments(List<NoteInformation> toInsert, Connection pgi) {
         var leader_query ="""
-                INSERT INTO notes.note_segment_leaders
+                INSERT INTO note_segment_leaders
                 (note_version, noteid, segment_num, leader_type, "content")
-                VALUES(?, ?, ?, (?)::notes.segment_type, ?)
+                VALUES(?, ?, ?, (?)::segment_type, ?)
                 on conflict do nothing
                 """;
         var follower_query = """
-                INSERT INTO notes.note_segment_followers
+                INSERT INTO note_segment_followers
                 (noteid, segment_num, sentence_num, follower_type, "content")
-                VALUES(?, ?, ?, (?)::notes.segment_type, ?)
+                VALUES(?, ?, ?, (?)::segment_type, ?)
                 on conflict do nothing
                 """;
         int inserted_segments = 0;
         int inserted_order = 0;
         logger.debug("PersistSegments: batch of {}", toInsert.size());
+        if (toInsert.size()==0 || toInsert.stream().mapToInt(note-> note.order.size()).sum()==0)
+            return 1;
         try (
              var mpo = pgi.prepareStatement(leader_query);
              var fpo = pgi.prepareStatement(follower_query)
