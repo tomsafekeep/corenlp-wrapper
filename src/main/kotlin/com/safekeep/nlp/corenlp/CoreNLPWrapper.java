@@ -152,7 +152,7 @@ public class CoreNLPWrapper {
             CoreDocument doc = new CoreDocument(text);
             nlp.annotate(doc);
             Annotation anns = doc.annotation();
-            var docSegments = organizeDocumentSegments(id, classifier, doc);
+            var docSegments = coreDocument2segments(id, classifier, doc);
             for(var segment:docSegments)
                 segments.add(new Segment(segment.type, segment.noteid, segments.size() /*position across all texts */, segment.content, segment.id));
         }
@@ -177,11 +177,11 @@ public class CoreNLPWrapper {
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
         var classifier = fasttextInstance2ClassifierFunction(segmentClassifier, prefixWithIsPreviousKey);
-        return organizeDocumentSegments(id, classifier, doc);
+        return coreDocument2segments(id, classifier, doc);
     }
 
     @NotNull
-    private List<Segment> organizeDocumentSegments(String id, BiFunction<String, SegmentType, String> segmentClassifier, CoreDocument doc) {
+    private List<Segment> coreDocument2segments(String id, BiFunction<String, SegmentType, String> segmentClassifier, CoreDocument doc) {
         int sentenceNum = 0;
         List<Segment> segments = new ArrayList<>();
         SegmentType previousSpanLabel = null;
@@ -199,7 +199,7 @@ public class CoreNLPWrapper {
                         {
                             String span = String.join(" ", spanTokens);
                             //By definition this is a key: var label = segmentClassifier.predict(span);
-                            var segment = new Segment(SegmentType.key, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                            var segment = new Segment(SegmentType.key, id, ((float) segments.size()) , span, noteidSegmentNum2SegmentId(id, segments.size()));
                             segments.add(segment);
                             spanTokens.clear();
                             previousSpanLabel = SegmentType.key;
@@ -218,7 +218,7 @@ public class CoreNLPWrapper {
                             var stype = ftLabel2SegmentType.get(label);
                             if (previousSpanLabel==SegmentType.key && stype==SegmentType.narrative)
                                 stype = SegmentType.value; //narrative and values are similar - prioritize value.
-                            var segment = new Segment(stype, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                            var segment = new Segment(stype, id, ((float) segments.size()) , span, noteidSegmentNum2SegmentId(id, segments.size()));
                             segments.add(segment);
                             previousSpanLabel= stype;
                             spanTokens.clear();
@@ -239,7 +239,7 @@ public class CoreNLPWrapper {
                 if (previousSpanLabel==SegmentType.key && segmentType==SegmentType.narrative) {
                     segmentType = SegmentType.value; //narrative and values are similar - prioritize value.
                 }
-                var segment = new Segment(insideMention?SegmentType.key: segmentType, id, ((float) segments.size()) , span, String.format("%s#%4d", id, segments.size()));
+                var segment = new Segment(insideMention?SegmentType.key: segmentType, id, ((float) segments.size()) , span, noteidSegmentNum2SegmentId(id, segments.size()));
                 segments.add(segment);
                 previousSpanLabel = segmentType;
                 spanTokens.clear();
@@ -247,6 +247,10 @@ public class CoreNLPWrapper {
             sentenceNum++;
         }
         return segments;
+    }
+
+    private String noteidSegmentNum2SegmentId(String id, int segmentNum) {
+        return String.format("%s#%4d", id, segmentNum);
     }
 
     Pattern kvpattern = Pattern.compile("^([a-zA-Z ]+)[:?](.+)");
