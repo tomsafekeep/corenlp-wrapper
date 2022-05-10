@@ -68,6 +68,15 @@ public class DatabaseTextProcessor {
         }
     }
 
+    private static ExecutorService currentThreadExecutorService() {
+        ThreadPoolExecutor.CallerRunsPolicy callerRunsPolicy = new ThreadPoolExecutor.CallerRunsPolicy();
+        return new ThreadPoolExecutor(0, 1, 0L, TimeUnit.SECONDS, new SynchronousQueue<Runnable>(), callerRunsPolicy) {
+            @Override
+            public void execute(Runnable command) {
+                callerRunsPolicy.rejectedExecution(command, this);
+            }
+        };
+    }
     final JFastText fasttext;
     final String host, database, username;
     final int port;
@@ -77,6 +86,8 @@ public class DatabaseTextProcessor {
     final CoreNLPWrapper nlp;
     final boolean prefixWithIsPreviousKey;
     final Mode mode;
+
+    @Deprecated
     public void processQueryFile(String query, String kvInsertQuery, File outputPath){
         try(
             Connection readConn = getConnection(host, port, database, username);
@@ -255,7 +266,7 @@ public class DatabaseTextProcessor {
                 ExecutorService es = nthreads > 1 ? new ThreadPoolExecutor(nthreads, threadLimit,
                 10000, TimeUnit.MILLISECONDS, rawQueue,
                             new ThreadPoolExecutor.CallerRunsPolicy())
-                        : Executors.newSingleThreadExecutor();
+                        : currentThreadExecutorService(); //Executors.newSingleThreadExecutor();
                 while (!rs.isClosed() /* defensive against calls to rs.next() within contentExtractor */
                         && rs.next()){
                     int ac=1;
@@ -264,7 +275,7 @@ public class DatabaseTextProcessor {
                     var content = contentExtractor.apply(rs); //e.g. rs.getString(2);
 
                     if (content!=null) {
-                        es.submit(()-> {
+                        es.execute(()-> {
                             submitFunction.apply(id, content, noteVersion, persistQueue);
                             if (persistQueue.size() >= insert_batch_size) {
                                 var batch = new ArrayList<T>(persistQueue.size());
@@ -292,9 +303,9 @@ public class DatabaseTextProcessor {
                 }
                 logger.info("Exhausted result set after {} rows. Await finishing {} tasks", processedRows, rawQueue.size());
                 resultSetExhausted.set(true);
-                es.shutdown();
+                //deprecate in favor of awaitTermination to wait for existing tasks: es.shutdown();
                 try {
-                    es.awaitTermination(300, TimeUnit.SECONDS);
+                    es.awaitTermination(nthreads>1?300:1, TimeUnit.SECONDS);
                     if (persistQueue.size() > 0) {
                         var batch = new ArrayList<T>(persistQueue.size());
                         synchronized (persistQueue) {

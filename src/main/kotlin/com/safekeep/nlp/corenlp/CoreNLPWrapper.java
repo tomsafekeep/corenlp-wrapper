@@ -29,6 +29,7 @@ public class CoreNLPWrapper {
     private static final char FIELD_SEPARATOR = '\t';
     private static final char SENTENCE_SEPARATOR = '\n';
     private static final char TOKEN_SEPARATOR = ' ';
+    public static final String NO_SEGMENT_QUALIFIED = "NO SEGMENT QUALIFIED";
     protected static Logger logger = LoggerFactory.getLogger(CoreNLPWrapper.class);
     record Segment(SegmentType type, String noteid, float pos, String content, String id){}
 
@@ -129,7 +130,12 @@ public class CoreNLPWrapper {
         var tokens = doc.tokens().stream().map(token -> token.word()).collect(Collectors.toList());
         return tokens;
     }
-    Map<String, SegmentType> ftLabel2SegmentType = Map.of(
+    Map<String, SegmentType> ftLabel2SegmentType =
+    true? Map.of("__label__key", SegmentType.key,
+            "__label__value", SegmentType.value,
+            "__label__non-informative", SegmentType.non_informative,
+            "__label__narrative", SegmentType.narrative):
+            Map.of(
             "__label__narrative", SegmentType.narrative, "__label__list_item", SegmentType.list_item,
             "__label__value", SegmentType.value, "__label__key_value", SegmentType.KV,
             "__label__list_header", SegmentType.list_header, "__label__non_informative", SegmentType.non_informative,
@@ -166,6 +172,14 @@ public class CoreNLPWrapper {
                         prefixWithIsPreviousKey && previousLabel!=null?
                             String.join(" ", previousLabel.name(), val)
                             :val)
+                /*(val, previousLabel) -> {
+                    var probs = segmentClassifier.predictProba(
+                            prefixWithIsPreviousKey && previousLabel != null ?
+                                    String.join(" ", previousLabel.name(), val)
+                                    : val
+                            ,10);
+                    return probs.get(0).label;
+                }*/
                 :
                 (val, previousLabel) -> previousLabel==SegmentType.key?
                         "__label__value":
@@ -215,7 +229,7 @@ public class CoreNLPWrapper {
                         if (spanTokens.size()>0){
                             String span = String.join(" ", spanTokens);
                             var label = segmentClassifier.apply(span, previousSpanLabel);
-                            var stype = ftLabel2SegmentType.get(label);
+                            var stype = label==null?SegmentType.narrative:ftLabel2SegmentType.get(label);
                             if (previousSpanLabel==SegmentType.key && stype==SegmentType.narrative)
                                 stype = SegmentType.value; //narrative and values are similar - prioritize value.
                             var segment = new Segment(stype, id, ((float) segments.size()) , span, noteidSegmentNum2SegmentId(id, segments.size()));
@@ -235,7 +249,8 @@ public class CoreNLPWrapper {
             }
             if (spanTokens.size()>0){
                 String span = String.join(" ", spanTokens);
-                SegmentType segmentType = ftLabel2SegmentType.get(segmentClassifier.apply(span, previousSpanLabel));
+                String label = segmentClassifier.apply(span, previousSpanLabel);
+                SegmentType segmentType = label==null?SegmentType.narrative:ftLabel2SegmentType.get(label);
                 if (previousSpanLabel==SegmentType.key && segmentType==SegmentType.narrative) {
                     segmentType = SegmentType.value; //narrative and values are similar - prioritize value.
                 }
@@ -348,8 +363,16 @@ public class CoreNLPWrapper {
             }
         }
 
-        Collections.sort(content, (s1, s2) -> Float.compare(s1.pos, s2.pos));
         logger.debug("Processed: content: {}, order: {} items", content.size(), main.size());
+        if (content.size()>0){
+            Collections.sort(content, (s1, s2) -> Float.compare(s1.pos, s2.pos));
+        } else{
+            String noteid = segments.get(0).noteid;
+            Segment segment = new Segment(SegmentType.non_informative, noteid, ((float) segments.size()), NO_SEGMENT_QUALIFIED, noteidSegmentNum2SegmentId(noteid, 0));
+            content.add(segment);
+            var link = new NoteSegment(noteid, main.size(), segment, List.of());
+            main.add(link);
+        }
         return new NoteInformation(content, main, noteVersion);
     }
 
