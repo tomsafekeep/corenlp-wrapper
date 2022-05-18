@@ -1,6 +1,7 @@
 package com.safekeep.nlp.corenlp;
 
 import com.github.jfasttext.JFastText;
+import edu.stanford.nlp.pipeline.StanfordCoreNLP;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -54,11 +55,16 @@ public class DatabaseTextProcessor {
         var conn = DriverManager.getConnection("jdbc:postgresql://"+host+":"+Integer.toString(port)+"/"+database, username, password);
         return conn;
     }
+    public static Connection getConnection(String host, int port, String database, String username, File pgpass) throws SQLException {
+        var password = getPassword(host, port, database, username, pgpass);
+        var conn = DriverManager.getConnection("jdbc:postgresql://"+host+":"+Integer.toString(port)+"/"+database, username, password);
+        return conn;
+    }
 
 
     private Connection createInsertConnection() {
         try {
-            var conn = getConnection(host, port, database, username);
+            var conn = getConnection(host, port, database, username, pgpassTemp);
             conn.setAutoCommit(true);
             conn.setSchema(outputSchemaName);
             toClose.add(conn);
@@ -78,6 +84,7 @@ public class DatabaseTextProcessor {
         };
     }
     final JFastText fasttext;
+    final File kvLexiconFile;
     final String host, database, username;
     final int port;
     final String outputSchemaName;
@@ -87,87 +94,7 @@ public class DatabaseTextProcessor {
     final boolean prefixWithIsPreviousKey;
     final Mode mode;
 
-    @Deprecated
-    public void processQueryFile(String query, String kvInsertQuery, File outputPath){
-        try(
-            Connection readConn = getConnection(host, port, database, username);
-            Connection kvConn = getConnection(host, port, database, username);
-            BufferedWriter textWriter = Files.newBufferedWriter(outputPath.toPath(), StandardCharsets.UTF_8)
-        ){
-            readConn.setAutoCommit(false);
-            BlockingQueue<Runnable> queue = new ArrayBlockingQueue<>(1000);
-            int nthreads = Runtime.getRuntime().availableProcessors() ;
-            int threadLimit = nthreads;
-            try(
-                var source = readConn.prepareStatement(query);
-                var kvs = readConn.prepareStatement(kvInsertQuery);
-            ){
-                var rs = source.executeQuery();
-                int processedRows = 0;
-                AtomicInteger kvInsertBatch = new AtomicInteger();
-                int batchSize = 1000;
-                logger.info("Start executor service with {} threads", threadLimit);
-                ThreadPoolExecutor es = new ThreadPoolExecutor(nthreads, threadLimit, 10000, TimeUnit.MILLISECONDS, queue,
-                        new ThreadPoolExecutor.CallerRunsPolicy());
-                while (rs.next()){
-                    var content = rs.getString(1);
-                    var id = rs.getString(2);
-                    queue.add(()-> {
-                        try {
-                            nlp.processText(content, id, textWriter, tmentions->{
-                                synchronized (kvs) {
-                                    for (var mention:tmentions) {
-                                        int pi=1;
-                                        try {
-                                            kvs.setString(pi++, id);
-                                            kvs.setInt(pi++, mention.begin());
-                                            kvs.setInt(pi++, mention.end());
-                                            kvs.setString(pi++, mention.entityType());
-                                            kvs.setString(pi++, mention.surfaceForm());
-                                            kvs.addBatch();
-                                            int current = kvInsertBatch.incrementAndGet();
-                                            if (current>=batchSize){
-                                                logger.info("Persisting KV query with {} rows", current);
-                                                var inserted = kvs.executeBatch();
-                                                logger.info("Inserted {} rows", inserted);
-                                                kvs.clearBatch();
-                                                kvInsertBatch.set(0);
-                                            }
-                                        } catch (SQLException e) {
-                                            e.printStackTrace();
-                                        }
-                                    }
-                                }
-                            });
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
-                    });
-                }
-                logger.info("Await finishing {} tasks", queue.size());
-                es.shutdown();
-                try {
-                    es.awaitTermination(300, TimeUnit.SECONDS);
-                } catch (InterruptedException e) {
-                    logger.warn("Executor service timed-out");
-                }finally{
-                    int current = kvInsertBatch.incrementAndGet();
-                    if (current>=0){
-                        logger.info("Persisting last KV query batch with {} rows", current);
-                        var inserted = kvs.executeBatch();
-                        logger.info("Inserted {} rows", inserted);
-                        kvs.clearBatch();
-                        kvInsertBatch.set(0);
-                    }
-                }
-            }
-        } catch (SQLException e) {
-            e.printStackTrace();
-        } catch (IOException e) {
-            e.printStackTrace();
-        }
-    }
-
+    File pgpassTemp = new File(System.getenv("$HOME"), ".pgpass");
 
     @FunctionalInterface
     public interface SubmitFunction<C, T>{
@@ -211,6 +138,17 @@ public class DatabaseTextProcessor {
         }
     }
 
+
+    private void submitForTagging(String id, String content, Instant noteVersion, BlockingQueue<CoreNLPWrapper.TaggedNote> persistQueue){
+        var mentions = nlp.tagPreTokenizedText(content);
+        try {
+            if (mentions.size()>0)
+                persistQueue.put(new CoreNLPWrapper.TaggedNote(id, mentions));
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+            logger.warn("Inserting to persist queue was interrupted when trying to insert note {}", id);
+        }
+    }
     private static int persistTokens(List<TokenizedNote> toInsert, Connection pgi){
         var tokens_query = """
                 INSERT INTO note_all_tokens
@@ -238,12 +176,48 @@ public class DatabaseTextProcessor {
         logger.debug("inserted token records: {}", inserted);
         return inserted;
     }
+
+    private int persistTaggerMentions(List<CoreNLPWrapper.TaggedNote> toInsert, Connection pgi){
+        var tokens_query = """
+                INSERT INTO tagger_output
+                (batch, sid, "begin", "end", matching_tokens, term, lexicon)
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """;
+        logger.debug("PersistSegments: batch of {}", toInsert.size());
+        int inserted = 0;
+        try (
+                var mpo = pgi.prepareStatement(tokens_query);
+        ) {
+            for (var note : toInsert) {
+                for (var mention:note.mentions()){
+                    int ac = 1;
+                    mpo.setString(ac++, this.kvLexiconFile.getName());
+                    mpo.setString(ac++, note.noteid());
+                    mpo.setInt(ac++, mention.begin());
+                    mpo.setInt(ac++, mention.end());
+                    mpo.setString(ac++, mention.surfaceForm());
+                    mpo.setString(ac++, mention.entity());
+                    mpo.setString(ac++, this.kvLexiconFile.getName());
+
+                    mpo.addBatch();
+
+                }
+            }
+            for (int rows : mpo.executeBatch()) inserted += rows;
+        } catch (SQLException throwables) {
+            throwables.printStackTrace();
+            throw  new IllegalStateException(throwables);
+        }
+        logger.debug("inserted token records: {}", inserted);
+        return inserted;
+    }
+
     public <C, T> void processQuery(String sourceQuery, int nthreads, Function<ResultSet, C> contentExtractor, SubmitFunction<C, T> submitFunction, PersistenceFunction<T> persistenceFunction){
         int insert_batch_size = 1000;
         AtomicInteger total_inserted = new AtomicInteger();
         int processedRows = 0;
         try(
-                Connection readConn = getConnection(host, port, database, username);
+                Connection readConn = getConnection(host, port, database, username, pgpassTemp);
         ){
             readConn.setAutoCommit(false);
             try(var ps = readConn.prepareStatement("set enable_seqscan=false;")){
@@ -352,8 +326,32 @@ public class DatabaseTextProcessor {
         }else{
             fasttext = null;
         }
+        this.kvLexiconFile = kvLexiconFile;
         this.mode = mode;
         this.prefixWithIsPreviousKey = prefixWithIsPreviousKey;
+    }
+
+    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, String outputSchemaName, File kvLexiconFile, Properties properties) {
+        this.host = host;
+        this.port = port;
+        this.database = database;
+        this.username = username;
+        this.outputSchemaName = outputSchemaName;
+
+        var annotaorList = "tokenize,ssplit,regexner,entitymentions";
+        Properties props = new Properties();
+        props.setProperty("annotators", annotaorList);
+        props.setProperty("regexner.mapping", kvLexiconFile.getAbsolutePath());
+        props.setProperty("tokenize.whitespace", Boolean.toString(true));
+        props.setProperty("ssplit.eolonly", Boolean.toString(true));
+        props.setProperty("tokenize.options", "");
+        logger.info("Instantiate CoreNLP with options: {}", props.toString());
+        nlp = new CoreNLPWrapper(kvLexiconFile,props);
+
+        this.kvLexiconFile = kvLexiconFile;
+        fasttext=null;
+        prefixWithIsPreviousKey=false;
+        this.mode=mode;
     }
 
     public static String getContent(ResultSet rs){
@@ -364,7 +362,7 @@ public class DatabaseTextProcessor {
         }
     }
 
-    public enum Mode {RAW_TO_TOKENS, RAW_TO_SEGMENTS, CHUNKS_TO_SEGMENTS}
+    public enum Mode {RAW_TO_TOKENS, RAW_TO_SEGMENTS, CHUNKS_TO_SEGMENTS, TAG}
     public static void main(String[] args){
         // arguments for example
         String host="127.0.0.1", database="db", username="user", outputSchemaName="public";
@@ -416,10 +414,10 @@ public class DatabaseTextProcessor {
                 extraCoreNLPProperties.put("regexner.ignorecase", Boolean.toString(ignoreCase));
             }
             switch (mode){
-                case RAW_TO_SEGMENTS, CHUNKS_TO_SEGMENTS -> {
+                case RAW_TO_SEGMENTS, CHUNKS_TO_SEGMENTS, TAG -> {
                     kvLexiconFile = new File(props.getProperty("kv_lexicon"));
                     String scPath = props.getProperty("segment_classifier");
-                    segmentClassifierFile = scPath.trim().equals("null")?null:new File(scPath);
+                    segmentClassifierFile = scPath==null || scPath.trim().equals("null")?null:new File(scPath);
                     prefixWithIsPreviousKey = Boolean.parseBoolean(props.getProperty("prefix_with_is_previous_a_key", "false"));
                 }
                 default ->{}
@@ -429,6 +427,10 @@ public class DatabaseTextProcessor {
         }
         DatabaseTextProcessor processor;
         switch (mode){
+            case TAG -> {
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, (Properties)null);
+                processor.processQuery(notesQuery, nthreads, DatabaseTextProcessor::getContent, processor::submitForTagging, processor::persistTaggerMentions);
+            }
             case RAW_TO_SEGMENTS -> {
                 processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
                 processor.processQuery(notesQuery, nthreads, DatabaseTextProcessor::getContent, processor::submitForSegmentation, CoreNLPWrapper::persistSegments);

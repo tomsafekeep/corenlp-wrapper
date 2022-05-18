@@ -36,6 +36,7 @@ public class CoreNLPWrapper {
     record NoteSegment(String noteid, int pos, Segment main, List<Segment> values){}
     record NoteInformation(List<Segment> content, List<NoteSegment> order, Instant note_version){}
 
+    record TaggedNote(String noteid, List<TaggerWrapper.TaggerMention> mentions){};
     private StanfordCoreNLP nlp;
     final boolean useTagger;
     private static String quotedSchema;
@@ -67,59 +68,6 @@ public class CoreNLPWrapper {
         logger.info("Instantiate CoreNLP with options: {}", props.toString());
         nlp = new StanfordCoreNLP(props);
         logger.info("CoreNLP options: {}", nlp.getProperties());
-
-        RegexNERAnnotator a;
-    }
-
-    public record TaggerMention(String entityType, int begin, int end, String surfaceForm) {
-    }
-
-    ;
-
-    @FunctionalInterface
-    public static interface MentionConsumer {
-        public void accept(List<TaggerMention> mentions);
-    }
-
-    public void processText(String text, String id, Writer writer, MentionConsumer mentionConsumer) throws IOException {
-
-        CoreDocument doc = new CoreDocument(text);
-        nlp.annotate(doc);
-        Annotation anns = doc.annotation();
-        //The basic unit of processing is a token, so this iteration is hard coded.
-        int sentenceCounter = 0;
-
-        for (CoreMap sentence : anns.get(CoreAnnotations.SentencesAnnotation.class)) {
-            var sentenceid = String.format("%s%s%d", id.replace(FIELD_SEPARATOR, ' '), FIELD_SEPARATOR, sentenceCounter);
-            if (sentenceid != null) {
-                writer.append(sentenceid);
-                writer.append(FIELD_SEPARATOR);
-            }
-            for (CoreLabel token : sentence.get(CoreAnnotations.TokensAnnotation.class)) {
-                String t = token.getString(CoreAnnotations.TextAnnotation.class);
-                if (t != null && t.length() > 0) {
-                    writer.append(t);
-                    writer.append(TOKEN_SEPARATOR);
-                }
-            }
-            writer.append(SENTENCE_SEPARATOR);
-        }
-        var mentions = doc.entityMentions();
-        if (useTagger) {
-            var tmentions = mentions.stream().map(mention -> {
-                //for (var mention:mentions){
-                var mtokens = mention.tokens();
-                if (mtokens.size() > 0) {
-                    return new TaggerMention(mention.entityType(), mtokens.get(0).index(), mtokens.get(mtokens.size() - 1).index(), mention.text());
-                } else
-                    return null;
-            }).filter(m -> m != null).collect(Collectors.toList());
-            if (
-                    tmentions != null
-                            && tmentions.size() > 0) {
-                mentionConsumer.accept(tmentions);
-            }
-        }
     }
 
     public List<String> processText(String text) {
@@ -432,5 +380,27 @@ public class CoreNLPWrapper {
         }
         logger.debug("inserted_order: {}", inserted_segments, inserted_order);
         return inserted_order;
+    }
+
+    public List<TaggerWrapper.TaggerMention> tagPreTokenizedText(String text){
+        CoreDocument doc = new CoreDocument(text);
+        nlp.annotate(doc);
+        Annotation anns = doc.annotation();
+        var mentions = doc.entityMentions();
+        if (mentions!=null){
+            var tmentions = mentions.stream().map(mention -> {
+                //for (var mention:mentions){
+                var mtokens = mention.tokens();
+                if (mtokens.size() > 0) {
+                    return new TaggerWrapper.TaggerMention(mention.entityType(), mtokens.get(0).index() -1 /* convert from 1-based to 0-based */,
+                            mtokens.get(mtokens.size() - 1).index() /* -1 to convert to 0 based, and +1 to convert to exclusive offset */,
+                            mention.text());
+                } else
+                    return null;
+            }).filter(m -> m != null).collect(Collectors.toList());
+            return tmentions;
+        }else{
+            return  List.of();
+        }
     }
 }
