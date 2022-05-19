@@ -3,10 +3,7 @@ package com.safekeep.nlp.corenlp;
 import com.github.jfasttext.JFastText;
 import edu.stanford.nlp.ling.CoreAnnotations;
 import edu.stanford.nlp.ling.CoreLabel;
-import edu.stanford.nlp.pipeline.Annotation;
-import edu.stanford.nlp.pipeline.CoreDocument;
-import edu.stanford.nlp.pipeline.RegexNERAnnotator;
-import edu.stanford.nlp.pipeline.StanfordCoreNLP;
+import edu.stanford.nlp.pipeline.*;
 import edu.stanford.nlp.util.CoreMap;
 import org.jetbrains.annotations.NotNull;
 import org.slf4j.Logger;
@@ -386,21 +383,19 @@ public class CoreNLPWrapper {
         CoreDocument doc = new CoreDocument(text);
         nlp.annotate(doc);
         Annotation anns = doc.annotation();
-        var mentions = doc.entityMentions();
-        if (mentions!=null){
-            var tmentions = mentions.stream().map(mention -> {
-                //for (var mention:mentions){
-                var mtokens = mention.tokens();
-                if (mtokens.size() > 0) {
-                    return new TaggerWrapper.TaggerMention(mention.entityType(), mtokens.get(0).index() -1 /* convert from 1-based to 0-based */,
-                            mtokens.get(mtokens.size() - 1).index() /* -1 to convert to 0 based, and +1 to convert to exclusive offset */,
-                            mention.text());
-                } else
-                    return null;
-            }).filter(m -> m != null).collect(Collectors.toList());
-            return tmentions;
-        }else{
-            return  List.of();
+        LabeledChunkIdentifier chunker = new LabeledChunkIdentifier();
+        var mentions = new ArrayList<TaggerWrapper.TaggerMention>();
+        /* This method expects a single sentence (since NER should not cross sentence boundaries anyway:for (var sent: doc.sentences())*/{
+            var sent = doc.sentences().get(0);
+            var tokens = sent.coreMap().get(CoreAnnotations.TokensAnnotation.class);
+            var chunks = chunker.getAnnotatedChunks(tokens, 0, CoreAnnotations.TextAnnotation.class, CoreAnnotations.NamedEntityTagAnnotation.class);
+            for (var chunk : chunks){
+                var mention = new TaggerWrapper.TaggerMention(chunk.get(CoreAnnotations.NamedEntityTagAnnotation.class), chunk.get(CoreAnnotations.TokenBeginAnnotation.class) ,
+                        chunk.get(CoreAnnotations.TokenEndAnnotation.class),
+                        chunk.get(CoreAnnotations.TextAnnotation.class));
+                mentions.add(mention);
+            }
         }
+        return mentions;
     }
 }

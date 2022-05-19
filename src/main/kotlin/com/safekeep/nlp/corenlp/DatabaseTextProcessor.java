@@ -1,15 +1,12 @@
 package com.safekeep.nlp.corenlp;
 
 import com.github.jfasttext.JFastText;
-import edu.stanford.nlp.pipeline.StanfordCoreNLP;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.BufferedReader;
-import java.io.BufferedWriter;
 import java.io.File;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.sql.*;
 import java.time.Instant;
@@ -64,7 +61,7 @@ public class DatabaseTextProcessor {
 
     private Connection createInsertConnection() {
         try {
-            var conn = getConnection(host, port, database, username, pgpassTemp);
+            var conn = getConnection(host, port, database, username, pgpass);
             conn.setAutoCommit(true);
             conn.setSchema(outputSchemaName);
             toClose.add(conn);
@@ -94,7 +91,7 @@ public class DatabaseTextProcessor {
     final boolean prefixWithIsPreviousKey;
     final Mode mode;
 
-    File pgpassTemp = new File(System.getenv("$HOME"), ".pgpass");
+    final File pgpass;
 
     @FunctionalInterface
     public interface SubmitFunction<C, T>{
@@ -217,7 +214,7 @@ public class DatabaseTextProcessor {
         AtomicInteger total_inserted = new AtomicInteger();
         int processedRows = 0;
         try(
-                Connection readConn = getConnection(host, port, database, username, pgpassTemp);
+                Connection readConn = getConnection(host, port, database, username, pgpass);
         ){
             readConn.setAutoCommit(false);
             try(var ps = readConn.prepareStatement("set enable_seqscan=false;")){
@@ -311,10 +308,11 @@ public class DatabaseTextProcessor {
         }
     }
 
-    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, String outputSchemaName, File kvLexiconFile, File segmentClassifierFile, boolean prefixWithIsPreviousKey, Properties extraCoreNLPProperties) {
+    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, File pgpass, String outputSchemaName, File kvLexiconFile, File segmentClassifierFile, boolean prefixWithIsPreviousKey, Properties extraCoreNLPProperties) {
         this.host = host;
         this.port = port;
         this.database = database;
+        this.pgpass = pgpass;
         this.username = username;
         this.outputSchemaName = outputSchemaName;
         this.nlp = new CoreNLPWrapper(kvLexiconFile, extraCoreNLPProperties);
@@ -331,10 +329,11 @@ public class DatabaseTextProcessor {
         this.prefixWithIsPreviousKey = prefixWithIsPreviousKey;
     }
 
-    public DatabaseTextProcessor(Mode mode, String host, int port, String database, String username, String outputSchemaName, File kvLexiconFile, Properties properties) {
+    public DatabaseTextProcessor(Mode mode, String host, int port, String database, File pgpass, String username, String outputSchemaName, File kvLexiconFile, Properties properties) {
         this.host = host;
         this.port = port;
         this.database = database;
+        this.pgpass = pgpass;
         this.username = username;
         this.outputSchemaName = outputSchemaName;
 
@@ -376,7 +375,7 @@ public class DatabaseTextProcessor {
         File kvLexiconFile = new File("");//lexicon file
         File segmentClassifierFile = new File("");//segment classifier
         boolean prefixWithIsPreviousKey = false;
-
+        File pgpass = new File(System.getenv("HOME"), ".pgpass");
         Properties props = new Properties();
         File propsFile = new File(args[0]);
         Mode mode=Mode.RAW_TO_TOKENS;
@@ -422,21 +421,24 @@ public class DatabaseTextProcessor {
                 }
                 default ->{}
             }
+            if (props.contains("pgpass")){
+                pgpass = new File(props.getProperty("pgpass"));
+            }
         } catch (IOException e) {
             e.printStackTrace();
         }
         DatabaseTextProcessor processor;
         switch (mode){
             case TAG -> {
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, (Properties)null);
+                processor = new DatabaseTextProcessor(mode, host, port, database, pgpass, username, outputSchemaName, kvLexiconFile, (Properties)null);
                 processor.processQuery(notesQuery, nthreads, DatabaseTextProcessor::getContent, processor::submitForTagging, processor::persistTaggerMentions);
             }
             case RAW_TO_SEGMENTS -> {
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, pgpass, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
                 processor.processQuery(notesQuery, nthreads, DatabaseTextProcessor::getContent, processor::submitForSegmentation, CoreNLPWrapper::persistSegments);
             }
             case CHUNKS_TO_SEGMENTS -> {
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, pgpass, outputSchemaName, kvLexiconFile, segmentClassifierFile, prefixWithIsPreviousKey, null);
                 AtomicReference<String> previousNoteid = new AtomicReference<>();
                 processor.processQuery(notesQuery, nthreads, (ResultSet rs)->{
                     try {
@@ -462,7 +464,7 @@ public class DatabaseTextProcessor {
             }
             case RAW_TO_TOKENS -> {
                 extraCoreNLPProperties.put("ssplit.isOneSentence", Boolean.toString(true));
-                processor = new DatabaseTextProcessor(mode, host, port, database, username, outputSchemaName, null, null, prefixWithIsPreviousKey, extraCoreNLPProperties);
+                processor = new DatabaseTextProcessor(mode, host, port, database, username, pgpass, outputSchemaName, null, null, prefixWithIsPreviousKey, extraCoreNLPProperties);
                 processor.processQuery(notesQuery, nthreads,DatabaseTextProcessor::getContent,  processor::submitForSingleSentenceTokenization, DatabaseTextProcessor::persistTokens);
             }
             default -> throw new IllegalStateException("Unexpected value: " + mode);
