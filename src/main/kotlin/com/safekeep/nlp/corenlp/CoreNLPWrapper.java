@@ -213,7 +213,7 @@ public class CoreNLPWrapper {
     }
 
     Pattern kvpattern = Pattern.compile("^([a-zA-Z ]+)[:?](.+)");
-    NoteInformation organizeSegments(List<Segment> segments, Instant noteVersion) {
+    NoteInformation organizeSegments(List<Segment> segments, String noteid, Instant noteVersion) {
         /*
         Imperative algorithm:
         1. Iterate over segments in sequential order.
@@ -311,7 +311,6 @@ public class CoreNLPWrapper {
         if (content.size()>0){
             Collections.sort(content, (s1, s2) -> Float.compare(s1.pos, s2.pos));
         } else{
-            String noteid = segments.get(0).noteid;
             Segment segment = new Segment(SegmentType.non_informative, noteid, ((float) segments.size()), NO_SEGMENT_QUALIFIED, noteidSegmentNum2SegmentId(noteid, 0));
             content.add(segment);
             var link = new NoteSegment(noteid, main.size(), segment, List.of());

@@ -107,7 +107,7 @@ public class DatabaseTextProcessor {
 
     private void submitForSegmentation(String id, String content, Instant noteVersion, BlockingQueue<CoreNLPWrapper.NoteInformation> persistQueue){
         var segments = nlp.processUnSegmentedText(content, id, fasttext, prefixWithIsPreviousKey);
-        var organized = nlp.organizeSegments(segments, noteVersion);
+        var organized = nlp.organizeSegments(segments, id, noteVersion);
         try {
             persistQueue.put(organized);
         } catch (InterruptedException e) {
@@ -117,7 +117,7 @@ public class DatabaseTextProcessor {
     }
     private void submitForOrganization(String id, String[] content, Instant noteVersion, BlockingQueue<CoreNLPWrapper.NoteInformation> persistQueue){
         var segments = nlp.processPreSegmentedText(List.of(content), id, fasttext, prefixWithIsPreviousKey);
-        var organized = nlp.organizeSegments(segments, noteVersion);
+        var organized = nlp.organizeSegments(segments, id, noteVersion);
         try {
             persistQueue.put(organized);
         } catch (InterruptedException e) {
@@ -274,7 +274,8 @@ public class DatabaseTextProcessor {
                 }
                 logger.info("Exhausted result set after {} rows. Await finishing {} tasks", processedRows, rawQueue.size());
                 resultSetExhausted.set(true);
-                //deprecate in favor of awaitTermination to wait for existing tasks: es.shutdown();
+                //deprecate in favor of awaitTermination to wait for existing tasks: 
+                es.shutdown();
                 try {
                     es.awaitTermination(nthreads>1?300:1, TimeUnit.SECONDS);
                     if (persistQueue.size() > 0) {
@@ -469,6 +470,7 @@ public class DatabaseTextProcessor {
             }
             default -> throw new IllegalStateException("Unexpected value: " + mode);
         }
-        logger.info("Finished");
+        logger.info("Finished. Exit JVMs");
+        System.exit(0); 
     }
 }
