@@ -217,9 +217,14 @@ public class DatabaseTextProcessor {
                 Connection readConn = getConnection(host, port, database, username, pgpass);
         ){
             readConn.setAutoCommit(false);
-            try(var ps = readConn.prepareStatement("set enable_seqscan=false;")){
-                ps.execute();
-            }
+            for (var stmt : List.of("set enable_seqscan=false", "set work_mem='4GB'", "set random_page_cost=1")) {
+            	logger.info("Execute setup statement: {}", stmt);
+            	try(var ps = readConn.prepareStatement(stmt)){
+            		var success = ps.execute();
+                	logger.info("Result: {}", success);
+                }
+        	}
+            
             BlockingQueue<Runnable> rawQueue = new ArrayBlockingQueue<>(1000);
             BlockingQueue<T> persistQueue = new ArrayBlockingQueue<>(insert_batch_size*5);
             AtomicBoolean resultSetExhausted = new AtomicBoolean(false);
@@ -247,7 +252,12 @@ public class DatabaseTextProcessor {
 
                     if (content!=null) {
                         es.execute(()-> {
-                            submitFunction.apply(id, content, noteVersion, persistQueue);
+                            try {
+								submitFunction.apply(id, content, noteVersion, persistQueue);
+							} catch (Exception ex) {
+								logger.info("Error while processing item |{}|:  {}", id, ex.getMessage());
+								ex.printStackTrace();
+							}
                             if (persistQueue.size() >= insert_batch_size) {
                                 var batch = new ArrayList<T>(persistQueue.size());
                                 synchronized (persistQueue) {
