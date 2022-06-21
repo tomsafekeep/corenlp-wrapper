@@ -235,7 +235,7 @@ public class DatabaseTextProcessor {
             try(
                     var source = readConn.prepareStatement(sourceQuery); //ResultSet.TYPE_SCROLL_INSENSITIVE is not supported for cursor-based resultsets in PG
             ){
-                source.setFetchSize(10000);
+                source.setFetchSize(100); // high fetch size value delays time to first record. Processing is slower than the DB round trip anyway.
                 var rs = source.executeQuery();
                 AtomicInteger kvInsertBatch = new AtomicInteger();
                 logger.info("Start executor service with {} threads", threadLimit);
